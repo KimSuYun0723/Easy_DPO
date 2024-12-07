@@ -1,4 +1,4 @@
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 import torch
 from huggingface_hub import login
@@ -11,7 +11,7 @@ def get_args():
     parser.add_argument("--token_id", type=str)
     parser.add_argument("--peft_model_path", type=str)
     parser.add_argument("--output_dir", type=str)
-    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--device", type=str, default="cuda:1")
 
     return parser.parse_args()
 
@@ -27,7 +27,7 @@ def main():
     print(f"Loading base model: {args.base_model_name_or_path}")
     base_model = AutoModelForCausalLM.from_pretrained(
         args.base_model_name_or_path,
-        load_in_8bit=True,
+        load_in_8bit=False,
         return_dict=True,
         torch_dtype=torch.float16,
         **device_arg

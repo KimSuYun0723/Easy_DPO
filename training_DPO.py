@@ -13,16 +13,23 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset, load_from_disk
 from peft import LoraConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments, BitsAndBytesConfig
-from accelerate import dispatch_model, infer_auto_device_map
-from accelerate.utils import get_balanced_memory
-from trl import DPOTrainer
+from trl import DPOTrainer, DPOConfig
 from huggingface_hub import login
 import argparse
 
+#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
+import os
+print("CUDA_VISIBLE_DEVICES:", os.getenv("CUDA_VISIBLE_DEVICES"))
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+import torch
 
+print("CUDA available:", torch.cuda.is_available())
+print("Device count:", torch.cuda.device_count())
+print("Current device:", torch.cuda.current_device())
 
 
 
@@ -42,28 +49,28 @@ def get_args():
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--lr_scheduler_type", type=str, default="linear")
     parser.add_argument("--warmup_steps",type=int,default=100)
-    parser.add_argument("--token_id", type =str, default='',help='please enter yout huggingface token ID')
+    parser.add_argument("--token_id", type =str, default='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',help='')
     parser.add_argument("--weight_decay",type=float,default=0.05)
     parser.add_argument("--optimizer_type", type=str, default="paged_adamw_32bit")
-    parser.add_argument("--per_device_train_batch_size", type=int, default=32)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--gradient_checkpointing", type=bool, default=True)
-    parser.add_argument("--lora_alpha", type=float, default=16)
-    parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--lora_alpha", type=float, default=8)
+    parser.add_argument("--lora_dropout", type=float, default=0.01)
     parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--max_prompt_length", type=int, default=4096)
-    parser.add_argument("--max_length", type=int, default=4096)
+    parser.add_argument("--max_prompt_length", type=int, default=1024)
+    parser.add_argument("--max_length", type=int, default=1024)
     parser.add_argument("--max_step", type=int, default=1000)
-    parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--save_steps", type=int, default=100)
-    parser.add_argument("--eval_steps", type=int, default=100)
+    parser.add_argument("--logging_steps", type=int, default=100)
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--eval_steps", type=int, default=500)
     parser.add_argument("--output_dir", type=str, default="./results")
     parser.add_argument("--log_freq", type=int, default=1)
     parser.add_argument("--sanity_check", type=bool, default=False)
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--ignore_bias_buffers", type=bool, default=False)
-    parser.add_argument("--lora_target_modules",type=list, default = ['embed_tokens', 'q_proj', 'k_proj', 'v_proj', 'gate_proj', 'down_proj', 'up_proj', 'lm_head'] )
+    parser.add_argument("--lora_target_modules",type=list, default = ['embed_tokens', 'q_proj', 'k_proj', 'v_proj', 'gate_proj', 'down_proj', 'up_proj'] ) # lm_head 지움
     
     return parser.parse_args()
 
@@ -73,7 +80,6 @@ def paired_data_preparation(
     data_dir: str = "", #default
     sanity_check: bool = False,
     cache_dir: str = None,
-    split_criteria: str = "train",
     num_proc: int=24,
 ) -> Dataset:
     """
@@ -87,9 +93,7 @@ def paired_data_preparation(
     Prompt의 구조는 다음과 같이 담기게 됩니다(알파카 프롬프트):  
       "###질문: " + <prompt> + "\n\n###답변: "
     """
-
-    dataset = load_dataset(data_dir, split=split_criteria ,cache_dir=cache_dir)
-    
+    dataset = load_from_disk(data_dir)
     
     original_columns = dataset.column_names
 
@@ -99,9 +103,9 @@ def paired_data_preparation(
     # 함수내에 정의되는 함수로, 각 데이터 포맷과 구조에 맞게 매핑해주는 역할을 진행합니다.
     def return_prompt_and_responses(samples) -> Dict[str, str]:
         return {
-            "prompt": ["###질문:\n" + question + "\n\n###답변:\n" for question in samples["question"]],
-            "chosen": samples["response_j"],
-            "rejected": samples["response_k"],
+            "prompt": ["###질문:\n" + question + "\n\n###답변:\n" for question in samples["prompt"]], ##
+            "chosen": samples["chosen"],
+            "rejected": samples["rejected"],
         }
 
     return dataset.map(
@@ -148,7 +152,7 @@ def main():
         low_cpu_mem_usage=True,
         torch_dtype=torch.float16,
         trust_remote_code=True,      
-        device_map="auto")
+        device_map={"": 0})
 
 
     model.config.use_cache = False
@@ -171,27 +175,25 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     #model.resize_token_embeddings(len(tokenizer))
-    
-    train_dataset = paired_data_preparation(data_dir= args.datapath, split_criteria= "train", sanity_check=args.sanity_check)
-    
+    dataset = paired_data_preparation(data_dir= args.datapath)
+    split_data = dataset.train_test_split(test_size=0.2)
+    train_dataset = split_data['train']
     train_dataset = train_dataset.filter(
-    
         lambda x: len(x["prompt"]) + len(x["chosen"]) <= args.max_length
-    
         and len(x["prompt"]) + len(x["rejected"]) <= args.max_length)
-    
 
-    eval_dataset = paired_data_preparation(data_dir= args.datapath, split_criteria= "validation", sanity_check=True)
+    print("=== TRAIN DATASET EX ===")
+    print(train_dataset[:2])
     
+    eval_dataset = split_data['test']
     eval_dataset = eval_dataset.filter(
-    
        lambda x: len(x["prompt"]) + len(x["chosen"]) <= args.max_length
-    
        and len(x["prompt"]) + len(x["rejected"]) <= args.max_length)
     
+    print("=== TEST DATASET EX ===")
+    print(eval_dataset[:2])
 
-
-    training_args = TrainingArguments(
+    training_args = DPOConfig(
         num_train_epochs= args.num_epochs,
         per_device_train_batch_size = args.per_device_train_batch_size,
         per_device_eval_batch_size = args.per_device_eval_batch_size,
@@ -210,9 +212,11 @@ def main():
         optim = args.optimizer_type,
         bf16 = True,
         remove_unused_columns = False,
-        run_name = "dpo_llama2",
+        run_name = "dpo_llama3b",
     )
 
+    for name, param in model.named_parameters():
+        print(name, param.requires_grad)
 
     peft_config = LoraConfig(
         r = args.lora_r,
